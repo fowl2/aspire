@@ -1144,4 +1144,65 @@ public class AzureStorageExtensionsTests(ITestOutputHelper output)
         var argsAnnotation = surrogate.Annotations.OfType<CommandLineArgsCallbackAnnotation>().ToList();
         Assert.NotEmpty(argsAnnotation);
     }
+
+    [Fact]
+    public void RunAsLocalEmulator_CreatesInstallerChildResource()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        builder.AddAzureStorage("storage").RunAsLocalEmulator();
+
+        var surrogate = builder.Resources.OfType<AzureStorageLocalEmulatorResource>().Single();
+        var installer = builder.Resources.OfType<ExecutableResource>()
+            .SingleOrDefault(r => r.Name == $"{surrogate.Name}-installer");
+
+        Assert.NotNull(installer);
+    }
+
+    [Fact]
+    public async Task RunAsLocalEmulator_InstallerHasCorrectNpmInstallArgs()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        builder.AddAzureStorage("storage").RunAsLocalEmulator();
+
+        var surrogate = builder.Resources.OfType<AzureStorageLocalEmulatorResource>().Single();
+        var installer = builder.Resources.OfType<ExecutableResource>()
+            .Single(r => r.Name == $"{surrogate.Name}-installer");
+
+        var args = await ArgumentEvaluator.GetArgumentListAsync(installer);
+
+        Assert.Contains("install", args);
+        Assert.Contains("--prefix", args);
+        // The args must reference the azurite package with a version pin.
+        Assert.Contains(args, a => a.StartsWith("azurite@"));
+    }
+
+    [Fact]
+    public void RunAsLocalEmulator_InstallerIsParentedToSurrogate()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        builder.AddAzureStorage("storage").RunAsLocalEmulator();
+
+        var surrogate = builder.Resources.OfType<AzureStorageLocalEmulatorResource>().Single();
+        var installer = builder.Resources.OfType<ExecutableResource>()
+            .Single(r => r.Name == $"{surrogate.Name}-installer");
+
+        // The installer must have a parent relationship annotation pointing to the surrogate.
+        Assert.True(installer.TryGetAnnotationsOfType<ResourceRelationshipAnnotation>(out var relationships));
+        Assert.Contains(relationships, r => r.Resource == surrogate && r.Type == "Parent");
+    }
+
+    [Fact]
+    public void RunAsLocalEmulator_SurrogateWaitsForInstallerCompletion()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        builder.AddAzureStorage("storage").RunAsLocalEmulator();
+
+        var surrogate = builder.Resources.OfType<AzureStorageLocalEmulatorResource>().Single();
+        var installer = builder.Resources.OfType<ExecutableResource>()
+            .Single(r => r.Name == $"{surrogate.Name}-installer");
+
+        // The surrogate must have a WaitAnnotation for the installer (WaitForCompletion).
+        Assert.True(surrogate.TryGetAnnotationsOfType<WaitAnnotation>(out var waits));
+        Assert.Contains(waits, w => w.Resource == installer && w.WaitType == WaitType.WaitForCompletion);
+    }
 }

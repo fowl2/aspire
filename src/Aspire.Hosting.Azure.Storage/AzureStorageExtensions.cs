@@ -6,13 +6,11 @@
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Azure;
 using Aspire.Hosting.Azure.Storage;
-using Aspire.Hosting.Dcp.Process;
 using Azure.Provisioning;
 using Azure.Provisioning.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Queues;
 using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Logging;
 
 namespace Aspire.Hosting;
 
@@ -486,75 +484,49 @@ public static class AzureStorageExtensions
             .WithRequiredCommand("node", "https://nodejs.org/en/download/")
             .WithRequiredCommand("npm", "https://nodejs.org/en/download/");
 
-        // Timeout for the npm install acquisition step. 5 minutes is generous for a single
-        // package install even on a slow connection; it prevents the resource from hanging
-        // indefinitely if npm is stuck (e.g. waiting for user input or a broken registry).
-        const int NpmInstallTimeoutSeconds = 300;
+        // -----------------------------------------------------------------------
+        // Installer child resource: runs `npm install --prefix <cache> azurite@<version>`.
+        // DCP manages the installer's lifecycle — its stdout/stderr stream to the Aspire dashboard
+        // resource log in real time, cancellation (app-host stop) kills the process tree, and the
+        // surrogate waits for successful completion before starting.
+        // -----------------------------------------------------------------------
+        var azuriteBin = Path.Combine(azuriteCacheDir, "node_modules", ".bin",
+            OperatingSystem.IsWindows() ? "azurite.cmd" : "azurite");
+
+        var npmCommand = OperatingSystem.IsWindows() ? "npm.cmd" : "npm";
+        var installerName = $"{surrogate.Name}-installer";
+        var installer = new ExecutableResource(installerName, npmCommand, azuriteCacheDir);
+        var installerBuilder = builder.ApplicationBuilder.AddResource(installer)
+            .WithParentRelationship(surrogate)
+            .ExcludeFromManifest()
+            .WithArgs("install", "--prefix", azuriteCacheDir, $"azurite@{AzuriteVersion}")
+            .WithRequiredCommand("npm", "https://nodejs.org/en/download/");
+
+        // The installer is only needed when the cache is not yet populated. If Azurite is
+        // already installed from a previous run, skip the install entirely.
+        if (File.Exists(azuriteBin))
+        {
+            // Already cached — suppress the installer so it doesn't run.
+            installerBuilder.WithExplicitStart();
+        }
+        else
+        {
+            // Surrogate waits for the installer to finish (exit 0) before DCP starts it.
+            surrogateBuilder.WaitForCompletion(installerBuilder);
+            // Pre-create the cache directory so npm doesn't fail on a missing prefix.
+            Directory.CreateDirectory(azuriteCacheDir);
+        }
 
         surrogateBuilder
             .OnBeforeResourceStarted(async (_, @event, ct) =>
             {
-                var logger = @event.Services.GetRequiredService<ResourceLoggerService>().GetLogger(surrogate);
-
-                // Hydrate the private Azurite install into the cache directory if it is missing.
-                // This avoids a machine-wide `npm install -g azurite` prerequisite.
-                var azuriteBin = Path.Combine(azuriteCacheDir, "node_modules", ".bin",
-                    OperatingSystem.IsWindows() ? "azurite.cmd" : "azurite");
-
+                // Resolve the binary path. If the installer ran during this session the binary
+                // now exists; if the cache was pre-populated it was already there.
                 if (!File.Exists(azuriteBin))
                 {
-                    logger.LogInformation("Azurite private cache not found at '{CacheDir}'. Running npm install to hydrate it...", azuriteCacheDir);
-                    Directory.CreateDirectory(azuriteCacheDir);
-
-                    // Use ProcessUtil.Run so output streams line-by-line to the dashboard in
-                    // real time, the process is killed on cancellation (via IAsyncDisposable),
-                    // and a timeout prevents hanging indefinitely.
-                    var npmCommand = OperatingSystem.IsWindows() ? "npm.cmd" : "npm";
-                    var processSpec = new ProcessSpec(npmCommand)
-                    {
-                        Arguments = $"install --prefix \"{azuriteCacheDir}\" azurite@{AzuriteVersion}",
-                        WorkingDirectory = azuriteCacheDir,
-                        // Stream every line to the resource logger visible in the Aspire dashboard.
-                        OnOutputData = line => logger.LogInformation("[npm] {Line}", line),
-                        OnErrorData = line => logger.LogWarning("[npm] {Line}", line),
-                        ThrowOnNonZeroReturnCode = false,
-                        KillEntireProcessTree = true,
-                    };
-
-                    // Combine the caller's cancellation token with a timeout so the install
-                    // cannot hang forever even if the token is never cancelled.
-                    using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-                    timeoutCts.CancelAfter(TimeSpan.FromSeconds(NpmInstallTimeoutSeconds));
-
-                    var (pendingResult, processDisposable) = ProcessUtil.Run(processSpec);
-
-                    await using (processDisposable.ConfigureAwait(false))
-                    {
-                        try
-                        {
-                            // WaitAsync propagates cancellation / timeout, which triggers
-                            // the await-using disposal path that kills the process tree.
-                            var result = await pendingResult.WaitAsync(timeoutCts.Token).ConfigureAwait(false);
-
-                            if (result.ExitCode != 0)
-                            {
-                                throw new DistributedApplicationException(
-                                    $"Failed to install Azurite {AzuriteVersion} into private cache '{azuriteCacheDir}' (exit code {result.ExitCode}). " +
-                                    "Ensure that Node.js and npm are available on PATH, or use RunAsEmulator() for container-backed Azurite.");
-                            }
-                        }
-                        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !ct.IsCancellationRequested)
-                        {
-                            // The timeout fired, not the caller's token — give a specific message.
-                            throw new DistributedApplicationException(
-                                $"Timed out after {NpmInstallTimeoutSeconds}s while installing Azurite into '{azuriteCacheDir}'. " +
-                                "Check network connectivity or use RunAsEmulator() for container-backed Azurite.");
-                        }
-                        // If ct was cancelled (user stopped the app host), OperationCanceledException
-                        // propagates naturally and the process is killed by the disposal path.
-                    }
-
-                    logger.LogInformation("Azurite {Version} installed into private cache '{CacheDir}'.", AzuriteVersion, azuriteCacheDir);
+                    throw new DistributedApplicationException(
+                        $"Azurite binary not found at '{azuriteBin}' after installation. " +
+                        "Ensure that Node.js and npm are available on PATH, or use RunAsEmulator() for container-backed Azurite.");
                 }
 
                 // Rewrite the ExecutableAnnotation command to the resolved binary path so DCP

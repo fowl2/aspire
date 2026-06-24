@@ -140,7 +140,6 @@
     <InternalsVisibleTo Include="Aspire.TestUtilities" />
     <InternalsVisibleTo Include="Aspire.Cli.Tests" />
     <InternalsVisibleTo Include="Aspire.Hosting.Kubernetes" />
-    <InternalsVisibleTo Include="Aspire.Hosting.Azure.Storage" />
     <InternalsVisibleTo Include="Aspire.Hosting.RemoteHost.Tests" />
   </ItemGroup>
 
