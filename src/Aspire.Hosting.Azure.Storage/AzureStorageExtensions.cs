@@ -3,6 +3,7 @@
 
 #pragma warning disable ASPIREAZURE003 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
 
+using System.Diagnostics;
 using Aspire.Hosting.ApplicationModel;
 using Aspire.Hosting.Azure;
 using Aspire.Hosting.Azure.Storage;
@@ -11,6 +12,7 @@ using Azure.Provisioning.Storage;
 using Azure.Storage.Blobs;
 using Azure.Storage.Queues;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Aspire.Hosting;
 
@@ -345,6 +347,256 @@ public static class AzureStorageExtensions
         {
             endpoint.Port = port;
         });
+    }
+
+    /// <summary>
+    /// Modifies the host port that the local Azurite process listens on for blob requests.
+    /// </summary>
+    /// <param name="builder">Local storage emulator resource builder.</param>
+    /// <param name="port">Host port to use.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    [AspireExport("withLocalEmulatorBlobPort")]
+    public static IResourceBuilder<AzureStorageLocalEmulatorResource> WithBlobPort(this IResourceBuilder<AzureStorageLocalEmulatorResource> builder, int port)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithEndpoint("blob", endpoint =>
+        {
+            endpoint.Port = port;
+        });
+    }
+
+    /// <summary>
+    /// Modifies the host port that the local Azurite process listens on for queue requests.
+    /// </summary>
+    /// <param name="builder">Local storage emulator resource builder.</param>
+    /// <param name="port">Host port to use.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    [AspireExport("withLocalEmulatorQueuePort")]
+    public static IResourceBuilder<AzureStorageLocalEmulatorResource> WithQueuePort(this IResourceBuilder<AzureStorageLocalEmulatorResource> builder, int port)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithEndpoint("queue", endpoint =>
+        {
+            endpoint.Port = port;
+        });
+    }
+
+    /// <summary>
+    /// Modifies the host port that the local Azurite process listens on for table requests.
+    /// </summary>
+    /// <param name="builder">Local storage emulator resource builder.</param>
+    /// <param name="port">Host port to use.</param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    [AspireExport("withLocalEmulatorTablePort")]
+    public static IResourceBuilder<AzureStorageLocalEmulatorResource> WithTablePort(this IResourceBuilder<AzureStorageLocalEmulatorResource> builder, int port)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+
+        return builder.WithEndpoint("table", endpoint =>
+        {
+            endpoint.Port = port;
+        });
+    }
+
+    /// <summary>
+    /// Configures an Azure Storage resource to run Azurite as a local (non-containerized) process.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This method acquires Azurite into a private per-user cache directory
+    /// (<c>~/.aspire/azurite/&lt;version&gt;</c>) on first use using <c>npm install</c>, then starts
+    /// the locally installed executable. Node.js and npm must be available on <c>PATH</c>.
+    /// </para>
+    /// <para>
+    /// Emulator data (blob, queue, table files) is persisted under
+    /// <c>.azurite/&lt;resourceName&gt;</c> relative to the AppHost directory by default, matching
+    /// the existing <see cref="WithDataBindMount"/> semantics so data survives across runs.
+    /// </para>
+    /// <para>
+    /// All connection-string, health-check, seeding, and Azure Functions configuration behaviour is
+    /// identical to the container-backed <see cref="RunAsEmulator"/> overload.
+    /// </para>
+    /// </remarks>
+    /// <param name="builder">The Azure storage resource builder.</param>
+    /// <param name="configureExecutable">
+    /// Optional callback that receives the <see cref="AzureStorageLocalEmulatorResource"/> builder for
+    /// further customization (e.g. overriding ports via <see cref="WithBlobPort(IResourceBuilder{AzureStorageLocalEmulatorResource}, int)"/>,
+    /// <see cref="WithQueuePort(IResourceBuilder{AzureStorageLocalEmulatorResource}, int)"/>,
+    /// <see cref="WithTablePort(IResourceBuilder{AzureStorageLocalEmulatorResource}, int)"/>).
+    /// </param>
+    /// <param name="dataPath">
+    /// Relative path (from the AppHost directory) where Azurite persists blob, queue, and table data.
+    /// Defaults to <c>.azurite/&lt;resourceName&gt;</c>.
+    /// </param>
+    /// <returns>A reference to the <see cref="IResourceBuilder{T}"/>.</returns>
+    [AspireExport(RunSyncOnBackgroundThread = true)]
+    public static IResourceBuilder<AzureStorageResource> RunAsLocalEmulator(
+        this IResourceBuilder<AzureStorageResource> builder,
+        Action<IResourceBuilder<AzureStorageLocalEmulatorResource>>? configureExecutable = null,
+        string? dataPath = null)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        if (builder.Resource.IsHnsEnabled)
+        {
+            throw new InvalidOperationException("Emulator currently does not support data lake.");
+        }
+
+        if (builder.ApplicationBuilder.ExecutionContext.IsPublishMode)
+        {
+            return builder;
+        }
+
+        // Mark as emulator so IsEmulator, connection-string logic, and Azure Functions config all work
+        // identically to the container-backed RunAsEmulator path.
+        builder.WithAnnotation(new EmulatorResourceAnnotation());
+
+        // Expose the same three HTTP endpoints the container path exposes so that the Azurite
+        // command-line arguments and connection-string templates produced by the parent resource
+        // remain identical whether the backing is a container or a local process.
+        builder.WithHttpEndpoint(name: "blob", targetPort: 10000)
+               .WithHttpEndpoint(name: "queue", targetPort: 10001)
+               .WithHttpEndpoint(name: "table", targetPort: 10002);
+
+        BlobServiceClient? blobServiceClient = null;
+        QueueServiceClient? queueServiceClient = null;
+
+        // Resolve the data directory: default to <AppHostDir>/.azurite/<resourceName>.
+        var resolvedDataPath = Path.GetFullPath(
+            dataPath ?? Path.Combine(".azurite", builder.Resource.Name),
+            builder.ApplicationBuilder.AppHostDirectory);
+
+        // Private Azurite npm package cache lives under ~/.aspire/azurite/<version>.
+        // Tool binaries are separated from project data so the cache is reused across app hosts.
+        const string AzuriteVersion = "3.35.0";
+        var azuriteCacheDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            ".aspire", "azurite", AzuriteVersion);
+
+        // The surrogate is added to the model so DCP's GetExecutableResources() path picks it up
+        // and launches the Azurite process. It shares the parent resource's annotation bag so all
+        // endpoint, health-check, and lifecycle annotations land on the same backing store that
+        // the connection-string and Azure Functions configuration logic reads from.
+        var surrogate = new AzureStorageLocalEmulatorResource(builder.Resource);
+        var surrogateBuilder = builder.ApplicationBuilder.AddResource(surrogate);
+
+        // Validate that Node/npm are available; emit a clear warning if they are not.
+        surrogateBuilder
+            .WithRequiredCommand("node", "https://nodejs.org/en/download/")
+            .WithRequiredCommand("npm", "https://nodejs.org/en/download/");
+
+        surrogateBuilder
+            .OnBeforeResourceStarted(async (_, @event, ct) =>
+            {
+                var logger = @event.Services.GetRequiredService<ResourceLoggerService>().GetLogger(surrogate);
+
+                // Hydrate the private Azurite install into the cache directory if it is missing.
+                // This avoids a machine-wide `npm install -g azurite` prerequisite.
+                var azuriteBin = Path.Combine(azuriteCacheDir, "node_modules", ".bin",
+                    OperatingSystem.IsWindows() ? "azurite.cmd" : "azurite");
+
+                if (!File.Exists(azuriteBin))
+                {
+                    logger.LogInformation("Azurite private cache not found at '{CacheDir}'. Running npm install to hydrate it...", azuriteCacheDir);
+                    Directory.CreateDirectory(azuriteCacheDir);
+
+                    // npm install --prefix <cacheDir> azurite@<version>
+                    var install = new Process
+                    {
+                        StartInfo = new ProcessStartInfo
+                        {
+                            FileName = OperatingSystem.IsWindows() ? "npm.cmd" : "npm",
+                            Arguments = $"install --prefix \"{azuriteCacheDir}\" azurite@{AzuriteVersion}",
+                            RedirectStandardOutput = true,
+                            RedirectStandardError = true,
+                            UseShellExecute = false,
+                        }
+                    };
+
+                    install.Start();
+                    // Stream npm output to the resource log so users can see what is happening.
+                    var stdoutTask = install.StandardOutput.ReadToEndAsync(ct);
+                    var stderrTask = install.StandardError.ReadToEndAsync(ct);
+                    // Read both streams concurrently to avoid deadlocking when a pipe buffer fills.
+                    await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
+                    await install.WaitForExitAsync(ct).ConfigureAwait(false);
+
+                    if (install.ExitCode != 0)
+                    {
+                        logger.LogError("npm install for Azurite failed (exit {ExitCode}). stderr: {Stderr}",
+                            install.ExitCode, await stderrTask.ConfigureAwait(false));
+                        throw new DistributedApplicationException(
+                            $"Failed to install Azurite {AzuriteVersion} into private cache '{azuriteCacheDir}'. " +
+                            "Ensure that Node.js and npm are available on PATH, or use RunAsEmulator() for container-backed Azurite.");
+                    }
+
+                    logger.LogInformation("Azurite {Version} installed into private cache '{CacheDir}'.", AzuriteVersion, azuriteCacheDir);
+                }
+
+                // Rewrite the ExecutableAnnotation command to the resolved binary path so DCP
+                // launches the correct executable when it creates the process.
+                var execAnnotation = surrogate.Annotations.OfType<ExecutableAnnotation>().Last();
+                execAnnotation.Command = azuriteBin;
+                execAnnotation.WorkingDirectory = resolvedDataPath;
+
+                // Pre-create the data directory so Azurite doesn't fail on missing workspace.
+                Directory.CreateDirectory(resolvedDataPath);
+
+                // Initialise the service clients needed by the health check and seeding callbacks.
+                var blobConnectionString = await builder.Resource.GetBlobConnectionString().GetValueAsync(ct).ConfigureAwait(false)
+                    ?? throw new DistributedApplicationException($"BlobConnectionString is null for '{builder.Resource.Name}'.");
+                blobServiceClient = CreateBlobServiceClient(blobConnectionString);
+
+                var queueConnectionString = await builder.Resource.GetQueueConnectionString().GetValueAsync(ct).ConfigureAwait(false)
+                    ?? throw new DistributedApplicationException($"QueueConnectionString is null for '{builder.Resource.Name}'.");
+                queueServiceClient = CreateQueueServiceClient(queueConnectionString);
+            })
+            .OnResourceReady(async (_, @event, ct) =>
+            {
+                // Identical seeding behaviour to the container-backed RunAsEmulator path.
+                var checkedBlobClient = blobServiceClient ?? throw new InvalidOperationException($"{nameof(BlobServiceClient)} is not initialized.");
+                var checkedQueueClient = queueServiceClient ?? throw new InvalidOperationException($"{nameof(QueueServiceClient)} is not initialized.");
+
+                foreach (var container in builder.Resource.BlobContainers)
+                {
+                    var blobContainerClient = checkedBlobClient.GetBlobContainerClient(container.BlobContainerName);
+                    await blobContainerClient.CreateIfNotExistsAsync(cancellationToken: ct).ConfigureAwait(false);
+                }
+
+                foreach (var queue in builder.Resource.Queues)
+                {
+                    var queueClient = checkedQueueClient.GetQueueClient(queue.QueueName);
+                    await queueClient.CreateIfNotExistsAsync(cancellationToken: ct).ConfigureAwait(false);
+                }
+            });
+
+        // Azurite arguments — identical to the container path so endpoint and connection-string
+        // behaviour is consistent regardless of whether a container or process backs the emulator.
+        //   -l <dir>            : workspace / data directory
+        //   --blobHost 0.0.0.0  : listen on all interfaces (not just loopback) for DCP proxy
+        //   --disableProductStyleUrl : use path-style URLs (required for devstoreaccount1)
+        //   --skipApiVersionCheck   : default on (mirrors RunAsEmulator)
+        // See https://github.com/Azure/Azurite/blob/c3f93445fbd8fd54d380eb265a5665166c460d2b/Dockerfile#L47
+        surrogateBuilder
+            .WithArgs("-l", resolvedDataPath,
+                "--blobHost", "0.0.0.0",
+                "--queueHost", "0.0.0.0",
+                "--tableHost", "0.0.0.0",
+                "--disableProductStyleUrl",
+                SkipApiVersionCheckArgument);
+
+        // Shared health check — identical to container path.
+        var healthCheckKey = $"{builder.Resource.Name}_check";
+        builder.ApplicationBuilder.Services.AddHealthChecks().AddAzureBlobStorage(sp =>
+        {
+            return blobServiceClient ?? throw new InvalidOperationException("BlobServiceClient is not initialized.");
+        }, name: healthCheckKey);
+        surrogateBuilder.WithHealthCheck(healthCheckKey);
+
+        configureExecutable?.Invoke(surrogateBuilder);
+
+        return builder;
     }
 
     /// <summary>

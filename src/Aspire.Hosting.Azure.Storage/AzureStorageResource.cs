@@ -72,7 +72,13 @@ public class AzureStorageResource(string name, Action<AzureResourceInfrastructur
     /// <summary>
     /// Gets a value indicating whether the Azure Storage resource is running in the local emulator.
     /// </summary>
-    public bool IsEmulator => this.IsContainer();
+    /// <remarks>
+    /// <see langword="true"/> when the resource carries an <see cref="EmulatorResourceAnnotation"/>, which is
+    /// applied by both <see cref="AzureStorageExtensions.RunAsEmulator"/> (container-backed Azurite) and
+    /// <see cref="AzureStorageExtensions.RunAsLocalEmulator"/> (executable-backed Azurite). Deliberately does
+    /// not rely on <c>IsContainer()</c> so the local-executable path also satisfies this check.
+    /// </remarks>
+    public bool IsEmulator => this.IsEmulator();
 
     /// <summary>
     /// Gets the connection URI expression for the blob storage service.

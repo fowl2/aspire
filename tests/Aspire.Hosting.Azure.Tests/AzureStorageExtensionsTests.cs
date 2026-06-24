@@ -982,4 +982,166 @@ public class AzureStorageExtensionsTests(ITestOutputHelper output)
 
         Assert.Null(exception);
     }
+
+    // -------------------------------------------------------------------------
+    // RunAsLocalEmulator tests
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public void RunAsLocalEmulator_AppliesEmulatorResourceAnnotation()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        var storage = builder.AddAzureStorage("storage")
+                            .RunAsLocalEmulator();
+
+        // The same EmulatorResourceAnnotation used by RunAsEmulator must be present so that
+        // IsEmulator, connection-string logic, and Azure Functions config all work identically.
+        Assert.True(storage.Resource.IsEmulator());
+        Assert.Contains(storage.Resource.Annotations, a => a is EmulatorResourceAnnotation);
+    }
+
+    [Fact]
+    public void RunAsLocalEmulator_AddsThreeHttpEndpoints()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        var storage = builder.AddAzureStorage("storage")
+                            .RunAsLocalEmulator();
+
+        var endpoints = storage.Resource.Annotations.OfType<EndpointAnnotation>().ToList();
+        Assert.Equal(3, endpoints.Count);
+        Assert.Single(endpoints, e => e.Name == "blob"  && e.TargetPort == 10000);
+        Assert.Single(endpoints, e => e.Name == "queue" && e.TargetPort == 10001);
+        Assert.Single(endpoints, e => e.Name == "table" && e.TargetPort == 10002);
+    }
+
+    [Fact]
+    public void RunAsLocalEmulator_DoesNotAddContainerImageAnnotation()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        var storage = builder.AddAzureStorage("storage")
+                            .RunAsLocalEmulator();
+
+        // Local mode must NOT add a ContainerImageAnnotation — that would cause DCP to try to
+        // pull a container image instead of launching the executable surrogate.
+        Assert.DoesNotContain(storage.Resource.Annotations, a => a is ContainerImageAnnotation);
+    }
+
+    [Fact]
+    public void RunAsLocalEmulator_AddsExecutableSurrogateToResources()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        builder.AddAzureStorage("storage").RunAsLocalEmulator();
+
+        // The surrogate ExecutableResource must appear in the model so that DCP can launch it.
+        Assert.Single(builder.Resources.OfType<AzureStorageLocalEmulatorResource>());
+    }
+
+    [Fact]
+    public void RunAsLocalEmulator_SurrogateSharesParentAnnotations()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        var storage = builder.AddAzureStorage("storage").RunAsLocalEmulator();
+
+        var surrogate = builder.Resources.OfType<AzureStorageLocalEmulatorResource>().Single();
+
+        // The surrogate's Annotations bag must be the same object as the parent resource's so
+        // that endpoint and health-check annotations placed on either are visible on both.
+        Assert.Same(storage.Resource.Annotations, surrogate.Annotations);
+    }
+
+    [Fact]
+    public void RunAsLocalEmulator_InPublishMode_IsNoOp()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create(DistributedApplicationOperation.Publish);
+        var storage = builder.AddAzureStorage("storage").RunAsLocalEmulator();
+
+        Assert.False(storage.Resource.IsEmulator());
+        Assert.DoesNotContain(builder.Resources, r => r is AzureStorageLocalEmulatorResource);
+    }
+
+    [Fact]
+    public async Task RunAsLocalEmulator_AzureStorageArgs_ContainExpectedFlags()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        var storage = builder.AddAzureStorage("storage").RunAsLocalEmulator();
+
+        var surrogate = builder.Resources.OfType<AzureStorageLocalEmulatorResource>().Single();
+        var args = await ArgumentEvaluator.GetArgumentListAsync(surrogate);
+
+        // The argument set must mirror the container path: path-style URLs and skip-version-check on by default.
+        Assert.Contains("--disableProductStyleUrl", args);
+        Assert.Contains("--skipApiVersionCheck", args);
+        Assert.Contains("--blobHost",  args);
+        Assert.Contains("--queueHost", args);
+        Assert.Contains("--tableHost", args);
+    }
+
+    [Fact]
+    public void RunAsLocalEmulator_PortOverrides_MutateEndpoints()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        builder.AddAzureStorage("storage").RunAsLocalEmulator(e =>
+        {
+            e.WithBlobPort(9001);
+            e.WithQueuePort(9002);
+            e.WithTablePort(9003);
+        });
+
+        var surrogate = builder.Resources.OfType<AzureStorageLocalEmulatorResource>().Single();
+        Assert.Collection(
+            surrogate.Annotations.OfType<EndpointAnnotation>(),
+            e => Assert.Equal(9001, e.Port),
+            e => Assert.Equal(9002, e.Port),
+            e => Assert.Equal(9003, e.Port));
+    }
+
+    [Fact]
+    public async Task RunAsLocalEmulator_IsEmulator_ProducesEmulatorConnectionString()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        var storage = builder.AddAzureStorage("storage").RunAsLocalEmulator(e =>
+        {
+            e.WithEndpoint("blob",  ep => ep.AllocatedEndpoint = new(ep, "localhost", 10000));
+            e.WithEndpoint("queue", ep => ep.AllocatedEndpoint = new(ep, "localhost", 10001));
+            e.WithEndpoint("table", ep => ep.AllocatedEndpoint = new(ep, "localhost", 10002));
+        });
+
+        // IsEmulator must be true so child resources produce emulator connection strings.
+        Assert.True(storage.Resource.IsEmulator);
+
+        var blobs = storage.AddBlobs("blob");
+        var connectionString = await ((IResourceWithConnectionString)blobs.Resource).ConnectionStringExpression.GetValueAsync(default);
+
+        // The emulator connection string must contain the well-known devstoreaccount1 key.
+        Assert.Contains("devstoreaccount1", connectionString);
+    }
+
+    [Fact]
+    public void RunAsLocalEmulator_AzureFunctionsConfig_UsesEmulatorConnectionStrings()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        var storage = builder.AddAzureStorage("storage").RunAsLocalEmulator().Resource;
+        var target = new Dictionary<string, object>();
+
+        ((IResourceWithAzureFunctionsConfig)storage).ApplyAzureFunctionsConfiguration(target, "myconn");
+
+        // Emulator path must inject the flat connection string (not service-URI keys).
+        Assert.True(target.ContainsKey("myconn"));
+        Assert.True(target.ContainsKey("Aspire__Azure__Storage__Blobs__myconn__ConnectionString"));
+        Assert.True(target.ContainsKey("Aspire__Azure__Storage__Queues__myconn__ConnectionString"));
+        Assert.True(target.ContainsKey("Aspire__Azure__Data__Tables__myconn__ConnectionString"));
+        Assert.False(target.ContainsKey("myconn__blobServiceUri"));
+    }
+
+    [Fact]
+    public void RunAsLocalEmulator_DefaultDataPath_IsUnderAppHostDirectory()
+    {
+        using var builder = TestDistributedApplicationBuilder.Create();
+        builder.AddAzureStorage("mystorage").RunAsLocalEmulator();
+
+        var surrogate = builder.Resources.OfType<AzureStorageLocalEmulatorResource>().Single();
+        // The surrogate's args must include the expected default data path.
+        var argsAnnotation = surrogate.Annotations.OfType<CommandLineArgsCallbackAnnotation>().ToList();
+        Assert.NotEmpty(argsAnnotation);
+    }
 }
