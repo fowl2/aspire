@@ -100,6 +100,72 @@ The references can be passed to a project:
 api.WithReference(dataLake).WithReference(fileSystem);
 ```
 
+## Emulator usage
+
+Aspire supports running the Azure Storage emulator (Azurite) in two modes:
+
+### Container-backed emulator (default)
+
+When the AppHost starts, a local container running the Azurite emulator is also started:
+
+```csharp
+var storage = builder.AddAzureStorage("storage").RunAsEmulator();
+var blobs = storage.AddBlobs("blobs");
+```
+
+You can customize the container through the callback:
+
+```csharp
+var storage = builder.AddAzureStorage("storage").RunAsEmulator(container =>
+{
+    container.WithDataBindMount();       // persist data between runs
+    container.WithBlobPort(10000);       // override blob port
+    container.WithQueuePort(10001);      // override queue port
+    container.WithTablePort(10002);      // override table port
+});
+```
+
+### Local (non-containerized) emulator
+
+If you don't have a container runtime or prefer a lighter-weight development experience, you can run Azurite as a local process instead:
+
+```csharp
+var storage = builder.AddAzureStorage("storage").RunAsLocalEmulator();
+var blobs = storage.AddBlobs("blobs");
+```
+
+**Prerequisites:** Node.js and npm must be available on `PATH`. On first use, Aspire automatically installs Azurite into a private per-user cache (`~/.aspire/azurite/<version>`) so no global npm install is needed.
+
+**Data persistence:** Emulator data (blob, queue, table files) is stored under `.azurite/<resourceName>` relative to the AppHost project directory by default. You can override this with the `dataPath` parameter:
+
+```csharp
+var storage = builder.AddAzureStorage("storage")
+    .RunAsLocalEmulator(dataPath: "./my-custom-data");
+```
+
+You can also customize ports through the callback:
+
+```csharp
+var storage = builder.AddAzureStorage("storage").RunAsLocalEmulator(e =>
+{
+    e.WithBlobPort(9001);
+    e.WithQueuePort(9002);
+    e.WithTablePort(9003);
+});
+```
+
+### Choosing between container and local modes
+
+| | Container (`RunAsEmulator`) | Local (`RunAsLocalEmulator`) |
+|---|---|---|
+| **Requires** | Container runtime (Docker/Podman) | Node.js + npm on PATH |
+| **Isolation** | Full container isolation | Runs as a host process |
+| **Startup** | Pulls image on first use | npm install on first use |
+| **Data volumes** | Docker volumes / bind mounts | Host filesystem directory |
+| **Ideal for** | CI, reproducible environments | Lightweight local dev, no-Docker setups |
+
+Both modes produce identical connection strings, health-check behavior, blob/queue seeding, and Azure Functions configuration.
+
 ## Connection Properties
 
 When you reference Azure Storage resources using `WithReference`, the following connection properties are made available to the consuming project:
